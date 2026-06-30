@@ -15,11 +15,22 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from groq import Groq
 
 load_dotenv()  # pull GROQ_API_KEY from .env into the environment
 
 app = Flask(__name__)
+
+# Rate limiting keyed by client IP. memory:// is fine for single-process dev;
+# a real deployment would use a shared store (e.g. redis://) across workers.
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
@@ -249,7 +260,16 @@ def home():
     return "Provenance Guard is running."
 
 
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({
+        "error": "rate limit exceeded",
+        "detail": str(e.description),
+    }), 429
+
+
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per minute;100 per day")
 def submit():
     """Accept {text}, run both signals, combine, return a decision record.
 
@@ -284,47 +304,77 @@ def submit():
 
 @app.route("/appeal", methods=["POST"])
 def appeal():
-    """Accept {content_id, reason} from a creator who disputes a label.
+    """Accept {content_id, creator_reasoning} from a creator disputing a label.
 
-    Per planning.md: validate the submission exists, open an appeal record
-    (status under_review), flip the submission's review_status, and log an
-    appeal_submitted audit event.
+    Per planning.md: validate the submission exists, update its review_status
+    to under_review in storage, log the appeal alongside the original
+    classification in the audit log, and confirm receipt. No automated
+    re-classification — a human reviewer handles it via the queue.
     """
     body = request.get_json(silent=True) or {}
     content_id = (body.get("content_id") or "").strip()
-    reason = (body.get("reason") or "").strip()
-    if not content_id or not reason:
-        return jsonify({"error": "content_id and reason are required"}), 400
+    # Accept creator_reasoning (spec); tolerate legacy 'reason'.
+    creator_reasoning = (body.get("creator_reasoning") or body.get("reason") or "").strip()
+    if not content_id or not creator_reasoning:
+        return jsonify({"error": "content_id and creator_reasoning are required"}), 400
 
     submission = find_submission(content_id)
     if submission is None:
         return jsonify({"error": "unknown content_id"}), 404
 
+    # Snapshot of the original classification decision being appealed.
+    original_classification = {
+        "attribution": submission.get("attribution"),
+        "confidence": submission.get("confidence"),
+        "label": submission.get("label"),
+        "llm_score": submission.get("llm_score"),
+        "heuristic_score": submission.get("heuristic_score"),
+    }
+
     record = {
         "appeal_id": uuid.uuid4().hex,
         "content_id": content_id,
-        "reason": reason,
+        "creator_reasoning": creator_reasoning,
         "status": "under_review",
         "created_at": _now_iso(),
+        "original_classification": original_classification,
     }
     _append_jsonl(APPEALS_PATH, record)
-    # Audit the status flip published -> under_review (append-only log).
+
+    # Update the content's status in storage: published -> under_review.
+    set_review_status(content_id, "under_review")
+
+    # Log the appeal alongside the original classification in the audit log.
     append_log({
         "event": "appeal_submitted",
         "content_id": content_id,
         "timestamp": _now_iso(),
-        "reason": reason,
+        "creator_reasoning": creator_reasoning,
         "review_status": "under_review",
+        "original_classification": original_classification,
     })
-    return jsonify(record), 201
+
+    return jsonify({
+        "message": "Appeal received. This content is now under review.",
+        "appeal_id": record["appeal_id"],
+        "content_id": content_id,
+        "status": "under_review",
+    }), 201
 
 
-def submission_review_status(content_id):
-    """Derived status: under_review if an open appeal exists, else published."""
-    for ap in _read_jsonl(APPEALS_PATH):
-        if ap["content_id"] == content_id and ap["status"] == "under_review":
-            return "under_review"
-    return "published"
+def set_review_status(content_id, status):
+    """Update a submission's review_status in the audit log (in storage)."""
+    entries = _read_jsonl(AUDIT_LOG_PATH)
+    changed = False
+    for e in entries:
+        if e.get("event") != "appeal_submitted" and e.get("content_id") == content_id:
+            e["review_status"] = status
+            changed = True
+    if changed:
+        with open(AUDIT_LOG_PATH, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+    return changed
 
 
 @app.route("/appeals", methods=["GET"])
@@ -338,7 +388,7 @@ def appeals_queue():
         queue.append({
             "appeal_id": ap["appeal_id"],
             "content_id": ap["content_id"],
-            "reason": ap["reason"],
+            "creator_reasoning": ap["creator_reasoning"],
             "submitted_at": sub.get("timestamp"),
             "text": sub.get("text"),
             "label": sub.get("label"),
