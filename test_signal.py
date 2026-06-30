@@ -1,8 +1,16 @@
-"""Independent test of Signal 1 (signal_llm) — calls the function directly,
-before it's trusted through the /submit endpoint. Run: python3 test_signal.py
+"""Independent test of both detection signals — calls the functions directly,
+before they're trusted through the /submit endpoint. Run: python3 test_signal.py
+
+signal_llm     = Signal 1 (Groq LLM classifier, needs GROQ_API_KEY)
+signal_heuristics = Signal 2 (local stylometry, no network)
 """
 
-from main import signal_llm
+from main import (
+    attribution_from_p_ai,
+    combine_signals,
+    signal_heuristics,
+    signal_llm,
+)
 
 CASES = [
     ("clearly AI", (
@@ -24,11 +32,22 @@ CASES = [
 ]
 
 
+def fmt(x):
+    return "None" if x is None else f"{x:.2f}"
+
+
 def main():
+    header = f"{'case':<30} {'sig1':>6} {'sig2':>6} {'combined':>9} {'attribution':>15}"
+    print(header)
+    print("-" * len(header))
     for label, text in CASES:
-        p_ai = signal_llm(text)
-        verdict = "ABSTAINED (None)" if p_ai is None else f"p_ai = {p_ai:.2f}"
-        print(f"[{label}]\n  {verdict}\n")
+        s1 = signal_llm(text)
+        s2 = signal_heuristics(text)
+        combined, degraded = combine_signals(s1, s2)
+        attribution = attribution_from_p_ai(combined)
+        flag = " (degraded)" if degraded else ""
+        print(f"{label:<30} {fmt(s1):>6} {fmt(s2):>6} {fmt(combined):>9} "
+              f"{attribution:>15}{flag}")
 
 
 if __name__ == "__main__":

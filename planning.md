@@ -32,8 +32,13 @@ Two independent signals, each emitting a `p_ai ∈ [0, 1]`.
 Weighted average, LLM trusted more because it reads meaning, not just surface stats:
 
 ```
-p_ai = 0.6 * llm.p_ai + 0.4 * heuristics.p_ai
+p_ai = 0.75 * llm.p_ai + 0.25 * heuristics.p_ai
 ```
+
+Weights set by calibration testing (see `test_calibration.py`): on prose the
+heuristic signal is weakly discriminative and biased low, so a higher weight
+dragged confident LLM scores below threshold. The LLM carries the decision;
+heuristics nudge.
 
 If the LLM signal abstains (`null`), fall back to heuristics alone (`p_ai = heuristics.p_ai`) and flag `degraded: true` on the record so the label can be softened. Both abstaining ⇒ `p_ai = 0.5` (forces an *Uncertain* label).
 
