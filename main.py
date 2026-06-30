@@ -8,13 +8,54 @@ Per planning.md:
 
 import json
 import os
+import uuid
+from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from groq import Groq
+
+load_dotenv()  # pull GROQ_API_KEY from .env into the environment
 
 app = Flask(__name__)
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# Structured audit log, one JSON object per line (JSON Lines). Survives
+# restarts and stays append-only. M5 may migrate this to SQLite (see
+# planning.md stack); the appeal endpoint looks submissions up by content_id.
+AUDIT_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_log.jsonl")
+
+
+def _now_iso():
+    """UTC timestamp with millisecond precision and a trailing Z."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def append_log(entry):
+    with open(AUDIT_LOG_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def get_log(limit=50):
+    """Return up to `limit` most-recent entries, newest first."""
+    try:
+        with open(AUDIT_LOG_PATH) as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+    return entries[::-1][:limit]
+
+
+def attribution_from_p_ai(p_ai):
+    """Map a p_ai score to a verdict using the planning.md decision bands."""
+    if p_ai is None:
+        return "uncertain"
+    if p_ai >= 0.65:
+        return "likely_ai"
+    if p_ai <= 0.35:
+        return "likely_human"
+    return "uncertain"
 
 # Instantiated lazily so the app still imports without a key set (e.g. tests
 # of signal_llm with a stubbed client).
@@ -84,27 +125,39 @@ def home():
 
 @app.route("/submit", methods=["POST"])
 def submit():
-    """Accept {text}, run Signal 1, return p_ai.
+    """Accept {text}, run Signal 1, return a decision record.
 
-    M3 stub: wires in Signal 1 only. M4 adds Signal 2 + the combiner; M5 adds
-    the transparency label, audit log, and persistence.
+    M3: Signal 1 only, with placeholder confidence/label. M4 adds Signal 2 +
+    the combiner (real confidence); M5 adds the real label and SQLite.
     """
     body = request.get_json(silent=True) or {}
     text = (body.get("text") or "").strip()
     if not text:
         return jsonify({"error": "missing 'text'"}), 400
 
-    p_ai = signal_llm(text)
-    return jsonify({
-        "p_ai": p_ai,
-        "degraded": p_ai is None,  # LLM abstained; M4 falls back to heuristics
-    })
+    llm_p_ai = signal_llm(text)  # Signal 1; None if it abstained
+
+    entry = {
+        "content_id": uuid.uuid4().hex,
+        "creator_id": body.get("creator_id", "anonymous"),
+        "timestamp": _now_iso(),
+        "attribution": attribution_from_p_ai(llm_p_ai),
+        "confidence": None,            # placeholder — M4 combiner fills this
+        "llm_score": llm_p_ai,         # Signal 1 score (None if abstained)
+        "status": "degraded" if llm_p_ai is None else "classified",
+        "text": text,                  # retained so the appeal reviewer sees the original
+    }
+    append_log(entry)
+    return jsonify(entry)
 
 
 @app.route("/log", methods=["GET"])
-def get_log():
-    ...  # M5: return the audit log
+def get_log_route():
+    limit = request.args.get("limit", default=50, type=int)
+    return jsonify({"entries": get_log(limit)})
 
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    # Port 5000 is taken by macOS AirPlay Receiver (ControlCenter), which
+    # returns 403s — use 5001 to avoid the clash.
+    app.run(port=5001, debug=True)
